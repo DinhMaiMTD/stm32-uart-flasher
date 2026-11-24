@@ -1,5 +1,2 @@
 pyserial>=3.5
-intelhex>=2.3.0
-ttkbootstrap>=1.10.0
 pyinstaller>=6.0.0
-

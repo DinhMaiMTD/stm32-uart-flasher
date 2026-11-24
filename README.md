@@ -1,4 +1,4 @@
-# STM32 UART Bootloader Flasher v1.0.0
+# STM32 UART Bootloader Flasher v1.1.0
 
 A simple, lightweight GUI tool for flashing STM32 microcontrollers via serial UART bootloader (ST AN3155 protocol).
 

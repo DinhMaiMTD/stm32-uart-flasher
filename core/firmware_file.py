@@ -1,17 +1,13 @@
 """
 Firmware file loader supporting both Intel HEX (.hex) and raw Binary (.bin).
-Extracts addresses, sizes, fills gaps, and calculates integrity checksums.
+Pure Python standard library implementation (zero external dependencies).
+Extracts addresses, sizes, fills gaps with 0xFF, and calculates integrity checksums.
 """
 
 from dataclasses import dataclass
 from pathlib import Path
 import binascii
 import hashlib
-
-try:
-    from intelhex import IntelHex
-except ImportError:
-    IntelHex = None
 
 
 @dataclass
@@ -31,10 +27,77 @@ class FirmwareInfo:
         return self.size_bytes / 1024.0
 
 
+def _parse_intel_hex(file_path: Path) -> tuple[int, int, bytes]:
+    """
+    Parse an Intel HEX (.hex) file using pure Python standard library.
+    Returns (start_address, end_address, binary_data_with_0xFF_gaps).
+    """
+    segments: list[tuple[int, bytes]] = []
+    upper_addr = 0
+    min_addr: int | None = None
+    max_addr: int | None = None
+
+    with open(file_path, "r", encoding="ascii", errors="ignore") as f:
+        for line_num, raw_line in enumerate(f, 1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            if not line.startswith(":"):
+                raise ValueError(f"Invalid Intel HEX record at line {line_num}: missing ':' prefix.")
+
+            raw_bytes = bytes.fromhex(line[1:])
+            if len(raw_bytes) < 5:
+                raise ValueError(f"Truncated Intel HEX record at line {line_num}.")
+
+            byte_count = raw_bytes[0]
+            addr_offset = (raw_bytes[1] << 8) | raw_bytes[2]
+            record_type = raw_bytes[3]
+            if len(raw_bytes) != byte_count + 5:
+                raise ValueError(f"Byte count mismatch in Intel HEX at line {line_num}.")
+
+            if (sum(raw_bytes) & 0xFF) != 0:
+                raise ValueError(f"Checksum error in Intel HEX at line {line_num}.")
+
+            payload = raw_bytes[4 : 4 + byte_count]
+
+            if record_type == 0x00:  # Data Record
+                if byte_count > 0:
+                    abs_addr = upper_addr + addr_offset
+                    segments.append((abs_addr, payload))
+                    seg_end = abs_addr + byte_count - 1
+                    if min_addr is None or abs_addr < min_addr:
+                        min_addr = abs_addr
+                    if max_addr is None or seg_end > max_addr:
+                        max_addr = seg_end
+            elif record_type == 0x01:  # End of File
+                break
+            elif record_type == 0x02:  # Extended Segment Address
+                if byte_count != 2:
+                    raise ValueError(f"Invalid Extended Segment Address record at line {line_num}.")
+                upper_addr = ((payload[0] << 8) | payload[1]) << 4
+            elif record_type == 0x04:  # Extended Linear Address
+                if byte_count != 2:
+                    raise ValueError(f"Invalid Extended Linear Address record at line {line_num}.")
+                upper_addr = ((payload[0] << 8) | payload[1]) << 16
+            elif record_type in (0x03, 0x05):  # Start Segment / Linear Address
+                continue
+
+    if min_addr is None or max_addr is None or min_addr > max_addr:
+        raise ValueError("Intel HEX file does not contain valid memory data.")
+
+    total_len = max_addr - min_addr + 1
+    buf = bytearray(b"\xFF" * total_len)
+    for seg_addr, seg_data in segments:
+        offset = seg_addr - min_addr
+        buf[offset : offset + len(seg_data)] = seg_data
+
+    return min_addr, max_addr, bytes(buf)
+
+
 def load_firmware(file_path: str, default_bin_address: int = 0x08000000) -> FirmwareInfo:
     """
     Load a firmware file (.hex or .bin).
-    
+
     :param file_path: Path to the firmware file.
     :param default_bin_address: Base flash address to use for .bin files (default 0x08000000).
     :return: FirmwareInfo object.
@@ -46,38 +109,18 @@ def load_firmware(file_path: str, default_bin_address: int = 0x08000000) -> Firm
     ext = path.suffix.lower()
 
     if ext == ".hex":
-        if IntelHex is None:
-            raise ImportError("Package 'intelhex' is required to load .hex files. Install it via 'pip install intelhex'.")
-        
-        ih = IntelHex()
-        ih.loadhex(str(path))
-        
-        start_addr = ih.minaddr()
-        end_addr = ih.maxaddr()
-        
-        if start_addr is None or end_addr is None or start_addr > end_addr:
-            raise ValueError("Intel Hex file does not contain valid memory data.")
-        
-        # Extract binary stream filling any sparse gap with 0xFF (erased flash state)
-        data = ih.tobinstr(start=start_addr, end=end_addr)
+        start_addr, end_addr, data = _parse_intel_hex(path)
         file_type = "HEX"
-
     elif ext in (".bin", ".raw"):
         data = path.read_bytes()
         start_addr = default_bin_address
         end_addr = start_addr + len(data) - 1 if data else start_addr
         file_type = "BIN"
-
     else:
-        # Default fallback: try to detect if it's text (HEX) or raw binary
         with open(path, "rb") as f:
             header = f.read(16)
-        if header.startswith(b":") and IntelHex is not None:
-            ih = IntelHex()
-            ih.loadhex(str(path))
-            start_addr = ih.minaddr()
-            end_addr = ih.maxaddr()
-            data = ih.tobinstr(start=start_addr, end=end_addr)
+        if header.startswith(b":"):
+            start_addr, end_addr, data = _parse_intel_hex(path)
             file_type = "HEX"
         else:
             data = path.read_bytes()

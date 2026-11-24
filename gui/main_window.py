@@ -1,6 +1,9 @@
 """
 GUI Application for STM32 Flasher.
-Modern, responsive, extra-large interface built with ttkbootstrap.
+Ultra-lightweight, instant-launch native Windows interface (Pure stdlib tkinter + ttk).
+Zero runtime image rendering, zero Pillow/ttkbootstrap overhead.
+Features Per-Monitor V2 Live DPI Scaling (bypassing Tcl/Tk's frozen GetDeviceCaps bug).
+
 Hardware Mapping:
 - RTS = BOOT (BOOT0 pin on STM32)
 - DTR = nRESET (NRST pin on STM32)
@@ -12,36 +15,100 @@ Boot Sequences:
 
 import os
 import sys
-import time
+import ctypes
 import threading
 from datetime import datetime
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import filedialog, messagebox
-import ttkbootstrap as tb
-from ttkbootstrap.constants import *
-from ttkbootstrap.scrolled import ScrolledText
+from tkinter import ttk, filedialog, messagebox
 
 from core import __version__
 from core.serial_comm import SerialComm
 from core.firmware_file import load_firmware, FirmwareInfo
-from core.bootloader import Stm32Bootloader, BootloaderError, CommandError, DataMismatchError, AbortedError
-from core.chip_db import lookup_chip_info, get_affected_sectors
+from core.bootloader import Stm32Bootloader, CommandError, AbortedError
+from core.chip_db import get_affected_sectors
 from gui.app_icon import apply_app_icon
 
 
+# Native Color Palette (Zero image generation)
+BADGE_COLORS = {
+    "primary": ("#0d6efd", "#ffffff"),
+    "info": ("#0aa2c0", "#ffffff"),
+    "success": ("#198754", "#ffffff"),
+    "warning": ("#f59f00", "#ffffff"),
+    "danger": ("#dc3545", "#ffffff"),
+    "secondary": ("#5c636a", "#ffffff"),
+}
+
+# Logical point sizes for named fonts (converted directly to physical pixels via live monitor DPI)
+FONT_SPECS = {
+    "TkDefaultFont": ("Segoe UI", 10, "normal"),
+    "TkTextFont": ("Segoe UI", 10, "normal"),
+    "TkMenuFont": ("Segoe UI", 10, "normal"),
+    "TkHeadingFont": ("Segoe UI", 10, "bold"),
+    "TkFixedFont": ("Consolas", 10, "normal"),
+    "AppTitleFont": ("Segoe UI", 13, "bold"),
+    "AppBoldFont": ("Segoe UI", 10, "bold"),
+    "AppSmallFont": ("Segoe UI", 9, "normal"),
+    "AppSmallBoldFont": ("Segoe UI", 9, "bold"),
+    "AppMonoFont": ("Consolas", 10, "normal"),
+}
+
+
+def get_live_window_dpi(root: tk.Tk, fallback: float = 96.0) -> float:
+    """
+    Query the real-time effective DPI of the monitor currently displaying `root`.
+    Uses GetDpiForMonitor / GetDpiForWindow on the top-level HWND (GA_ROOT) so changes
+    in Windows Display Settings are detected immediately without signing out of Windows.
+    """
+    if sys.platform != "win32":
+        return fallback
+    try:
+        wid = root.winfo_id()
+        if wid:
+            hwnd = ctypes.windll.user32.GetAncestor(wid, 2) or wid  # GA_ROOT = 2
+            hmon = ctypes.windll.user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST = 2
+            if hmon:
+                dpi_x = ctypes.c_uint(0)
+                dpi_y = ctypes.c_uint(0)
+                if ctypes.windll.shcore.GetDpiForMonitor(hmon, 0, ctypes.byref(dpi_x), ctypes.byref(dpi_y)) == 0:
+                    if dpi_x.value > 0:
+                        return float(dpi_x.value)
+            win_dpi = ctypes.windll.user32.GetDpiForWindow(hwnd)
+            if win_dpi > 0:
+                return float(win_dpi)
+    except Exception:
+        pass
+    return fallback
+
+
 class Stm32FlasherApp:
-    def __init__(self, root: tb.Window):
+    def __init__(self, root: tk.Tk, initial_dpi: float = 96.0):
         self.root = root
+        self.root.withdraw()  # Keep hidden while constructing widgets
         self.root.title(f"STM32 UART Bootloader Flasher v{__version__}")
-        self.root.geometry("980x740")
-        self.root.minsize(860, 640)
 
-        # Apply programmatic STM32 chip icon to Titlebar & Windows Taskbar
-        self.app_icons = apply_app_icon(self.root)
+        self.current_dpi = float(initial_dpi)
+        self.named_fonts: dict[str, tkfont.Font] = {}
+        self._main_thread_id = threading.get_ident()
 
-        # Apply ergonomic typography & clean styling (+2 font size)
-        self._apply_custom_styles()
+        # CRITICAL: Set initial geometry BEFORE any update_idletasks(), winfo_id(), or iconbitmap()
+        # so Tcl/Tk's CreateWindowExW creates the Win32 HWND at the exact final full size immediately
+        # (preventing Windows DWM from showing a 200x200 window and zooming it out).
+        scale = max(1.0, self.current_dpi / 96.0)
+        init_w = int(960 * scale)
+        init_h = int(680 * scale)
+        scr_w = self.root.winfo_screenwidth()
+        scr_h = self.root.winfo_screenheight()
+        init_w = min(init_w, int(scr_w * 0.94))
+        init_h = min(init_h, int(scr_h * 0.90))
+        pos_x = max(0, (scr_w - init_w) // 2)
+        pos_y = max(0, (scr_h - init_h) // 2 - int(20 * scale))
+        self.root.geometry(f"{init_w}x{init_h}+{pos_x}+{pos_y}")
+        self.root.minsize(int(860 * scale), int(580 * scale))
+
+        # Configure native Windows theme & DPI-accurate named pixel fonts
+        self._init_native_styles_and_fonts(self.current_dpi)
 
         # State variables
         self.firmware: FirmwareInfo | None = None
@@ -52,44 +119,158 @@ class Stm32FlasherApp:
         # Build UI
         self._init_variables()
         self._create_widgets()
-        self._refresh_com_ports()
 
+        # Populate initial logs and COM ports before showing the window
+        self._refresh_com_ports()
         self.log(f"STM32 UART Bootloader Flasher v{__version__} initialized.", "SUCCESS")
         self.log("Default Hardware Pinout: RTS = BOOT0 | DTR = NRST (100ms reset pulse).", "INFO")
         self.log("Ready. Select COM port and firmware file (.hex or .bin) to begin.", "INFO")
 
-    def _apply_custom_styles(self):
-        """Configure ergonomic typography and minimalist component spacing (+2 font sizes)."""
+        # Flush layout at full geometry, apply icon, and reveal window in one instant frame
+        self.root.update_idletasks()
+        apply_app_icon(self.root)
+        self.root.deiconify()
+
+        self.root.bind("<Configure>", self._on_window_configure, add="+")
+        self.root.after(400, self._poll_dpi_change)
+
+    @staticmethod
+    def _pt_to_neg_px(pt: float, dpi: float) -> int:
+        """
+        Convert typographic points (1/72 inch) to negative pixel height for Tcl/Tk.
+        Negative font sizes in Tcl/Tk pass pixel height directly to Win32 CreateFontIndirectW,
+        bypassing Tcl/Tk's buggy GetDeviceCaps(LOGPIXELSY) which stays frozen at logon DPI.
+        """
+        return -max(11, int(round(pt * dpi / 72.0)))
+
+    def _init_native_styles_and_fonts(self, dpi: float):
+        """Initialize Windows native theme and named fonts scaled to exact live monitor pixels."""
+        style = ttk.Style(self.root)
+        available = style.theme_names()
+        if "vista" in available:
+            style.theme_use("vista")
+        elif "xpnative" in available:
+            style.theme_use("xpnative")
+
+        # Create/configure all named fonts using exact negative pixel heights
+        existing_names = set(tkfont.names(self.root))
+        for name, (family, pt, weight) in FONT_SPECS.items():
+            px_size = self._pt_to_neg_px(pt, dpi)
+            try:
+                if name in existing_names:
+                    f = tkfont.nametofont(name)
+                    f.configure(family=family, size=px_size, weight=weight)
+                else:
+                    f = tkfont.Font(root=self.root, name=name, family=family, size=px_size, weight=weight)
+                self.named_fonts[name] = f
+            except Exception:
+                pass
+
+        # Ensure Combobox dropdown list uses the live-scaled TkTextFont
+        self.root.option_add("*TCombobox*Listbox.font", "TkTextFont")
+
+        self._refresh_ttk_styles(dpi)
+
+    def _refresh_ttk_styles(self, dpi: float):
+        """Configure ttk styles with DPI-scaled fonts and padding."""
         try:
-            for font_name in ("TkDefaultFont", "TkTextFont", "TkMenuFont"):
-                f = tkfont.nametofont(font_name)
-                f.configure(family="Segoe UI", size=12)
-            
-            f_fixed = tkfont.nametofont("TkFixedFont")
-            f_fixed.configure(family="Consolas", size=12)
+            self.root.tk.call("tk", "scaling", dpi / 72.0)
         except Exception:
             pass
 
-        # Configure ttk styles with balanced sizing (+2 sizes)
-        style = self.root.style
-        style.configure(".", font=("Segoe UI", 12))
-        style.configure("TLabelframe.Label", font=("Segoe UI", 12, "bold"))
-        style.configure("TCombobox", font=("Segoe UI", 12))
-        style.configure("TEntry", font=("Segoe UI", 12))
-        style.configure("TCheckbutton", font=("Segoe UI", 12))
-        style.configure("TRadiobutton", font=("Segoe UI", 12))
-        style.configure("TButton", font=("Segoe UI", 12))
+        style = ttk.Style(self.root)
+        style.configure(".", font="TkDefaultFont")
+        style.configure("TButton", font="TkDefaultFont")
+        style.configure("TCheckbutton", font="TkDefaultFont")
+        style.configure("TRadiobutton", font="TkDefaultFont")
+        style.configure("TCombobox", font="TkTextFont")
+        style.configure("TEntry", font="TkTextFont")
+        style.configure("TSpinbox", font="TkTextFont")
+        style.configure("TLabelframe.Label", font="AppBoldFont", foreground="#0d6efd")
+        style.configure("Bold.TLabel", font="AppBoldFont")
+        style.configure("Title.TLabel", font="AppTitleFont")
+        style.configure("Muted.TLabel", font="AppSmallFont", foreground="#555555")
+        style.configure("Success.TLabel", font="AppSmallBoldFont", foreground="#157347")
+        style.configure("Danger.TLabel", font="AppSmallBoldFont", foreground="#bb2d3b")
 
-        # Specialized button styles
-        style.configure("Flash.TButton", font=("Segoe UI", 13, "bold"))
-        style.configure("Action.TButton", font=("Segoe UI", 12, "bold"))
+    def _apply_window_geometry_for_dpi(self, dpi: float, center: bool = False):
+        """Scale window dimensions and minimum size proportionally to live monitor DPI."""
+        scale = max(1.0, dpi / 96.0)
+        self.root.update_idletasks()
+        req_w = self.root.winfo_reqwidth()
+        req_h = self.root.winfo_reqheight()
+
+        win_w = max(req_w + int(20 * scale), int(960 * scale))
+        win_h = max(req_h + int(24 * scale), int(680 * scale))
+        min_w = max(req_w, int(860 * scale))
+        min_h = max(req_h, int(580 * scale))
+
+        scr_w = self.root.winfo_screenwidth()
+        scr_h = self.root.winfo_screenheight()
+        win_w = min(win_w, int(scr_w * 0.94))
+        win_h = min(win_h, int(scr_h * 0.90))
+        min_w = min(min_w, win_w)
+        min_h = min(min_h, win_h)
+
+        self.root.minsize(min_w, min_h)
+        if center:
+            pos_x = max(0, (scr_w - win_w) // 2)
+            pos_y = max(0, (scr_h - win_h) // 2 - int(20 * scale))
+            self.root.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
+        else:
+            self.root.geometry(f"{win_w}x{win_h}")
+
+        # Flush Tcl's queued UpdateGeometryInfo while window is still withdrawn
+        # so the Win32 HWND is already at full size before deiconify() maps it.
+        self.root.update_idletasks()
+
+    def _apply_live_dpi_update(self, live_dpi: float):
+        """Rescale all named fonts, widget paddings, and window geometry when monitor DPI changes."""
+        self.current_dpi = live_dpi
+        for name, (_family, pt, _weight) in FONT_SPECS.items():
+            f = self.named_fonts.get(name)
+            if f is not None:
+                try:
+                    f.configure(size=self._pt_to_neg_px(pt, live_dpi))
+                except Exception:
+                    pass
+
+        scale = max(1.0, live_dpi / 96.0)
+        try:
+            self.badge_lbl.configure(padx=int(10 * scale), pady=int(4 * scale))
+            self.btn_detect.configure(padx=int(10 * scale), pady=int(3 * scale))
+            self.btn_flash.configure(padx=int(18 * scale), pady=int(6 * scale))
+            self.btn_cancel.configure(padx=int(14 * scale), pady=int(6 * scale))
+        except Exception:
+            pass
+
+        self._refresh_ttk_styles(live_dpi)
+        self._apply_window_geometry_for_dpi(live_dpi, center=False)
+
+    def _on_window_configure(self, _event=None):
+        """Detect cross-monitor DPI changes during window drag/resize."""
+        live_dpi = get_live_window_dpi(self.root, self.current_dpi)
+        if abs(live_dpi - self.current_dpi) >= 2.0:
+            self._apply_live_dpi_update(live_dpi)
+
+    def _poll_dpi_change(self):
+        """Lightweight periodic check (0.005ms) to catch in-place Windows Display Scale changes."""
+        try:
+            if not self.root.winfo_exists():
+                return
+            live_dpi = get_live_window_dpi(self.root, self.current_dpi)
+            if abs(live_dpi - self.current_dpi) >= 2.0:
+                self._apply_live_dpi_update(live_dpi)
+        except Exception:
+            pass
+        self.root.after(400, self._poll_dpi_change)
 
     def _init_variables(self):
         # Connection
         self.var_port = tk.StringVar()
         self.var_baud = tk.StringVar(value="115200")
         self.var_parity = tk.StringVar(value="Even (8E1)")
-        self.var_target_family = tk.StringVar(value="AUTO")
+        self.var_target_family = tk.StringVar(value="AUTO (Auto-Detect)")
 
         # Hardware sequence config (Explicit RTS=BOOT, DTR=nRESET)
         self.var_pin_mode = tk.StringVar(value="RTS = BOOT, DTR = nRESET (Standard)")
@@ -110,52 +291,59 @@ class Stm32FlasherApp:
         self.var_progress_info = tk.StringVar(value="Ready.")
         self.var_progress_val = tk.DoubleVar(value=0.0)
 
-    def _create_widgets(self):
-        # Main container with clean 12px padding
-        main_frame = tb.Frame(self.root, padding=12)
-        main_frame.pack(fill=BOTH, expand=YES)
-
-        # 1. Header (Minimalist & Sleek)
-        header = tb.Frame(main_frame)
-        header.pack(fill=X, pady=(0, 8))
-
-        title_frame = tb.Frame(header)
-        title_frame.pack(side=LEFT)
-
-        title_lbl = tb.Label(
-            title_frame,
-            text=f"⚡ STM32 Bootloader Flasher  v{__version__}",
-            font=("Segoe UI", 15, "bold"),
-            bootstyle="default",
+    def _make_flat_button(self, parent, text, bg, fg="#ffffff", active_bg=None, font="AppBoldFont", padx=12, pady=5, command=None, state="normal"):
+        """Create a fast native Win32 flat color button using named DPI-scaled font."""
+        return tk.Button(
+            parent,
+            text=text,
+            bg=bg,
+            fg=fg,
+            activebackground=active_bg or bg,
+            activeforeground=fg,
+            disabledforeground="#d0d0d0",
+            font=font,
+            relief=tk.FLAT,
+            bd=0,
+            padx=padx,
+            pady=pady,
+            cursor="hand2",
+            state=state,
+            command=command,
         )
-        title_lbl.pack(anchor="w")
 
-        sub_lbl = tb.Label(
+    def _create_widgets(self):
+        main_frame = ttk.Frame(self.root, padding=(12, 10))
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # 1. Header
+        header = ttk.Frame(main_frame)
+        header.pack(fill=tk.X, pady=(0, 8))
+
+        title_frame = ttk.Frame(header)
+        title_frame.pack(side=tk.LEFT)
+
+        ttk.Label(
+            title_frame,
+            text=f"⚡ STM32 UART Bootloader Flasher  v{__version__}",
+            style="Title.TLabel",
+        ).pack(anchor="w")
+
+        ttk.Label(
             title_frame,
             text="UART ISP  •  RTS = BOOT0  •  DTR = NRST  •  Auto-Detect & Sector Erase",
-            font=("Segoe UI", 11),
-            bootstyle="secondary",
-        )
-        sub_lbl.pack(anchor="w", pady=(1, 0))
+            style="Muted.TLabel",
+        ).pack(anchor="w")
 
-        # Status badge & Theme toggle on top right
-        self.badge_lbl = tb.Label(
+        self.badge_lbl = tk.Label(
             header,
             textvariable=self.var_status_badge,
-            font=("Segoe UI", 11, "bold"),
-            bootstyle="secondary-inverse",
-            padding=(10, 3),
+            font="AppSmallBoldFont",
+            bg="#0d6efd",
+            fg="#ffffff",
+            padx=10,
+            pady=4,
         )
-        self.badge_lbl.pack(side=RIGHT, padx=(6, 0))
-
-        theme_btn = tb.Button(
-            header,
-            text="🌓 Theme",
-            bootstyle="outline-secondary",
-            padding=(8, 3),
-            command=self._toggle_theme,
-        )
-        theme_btn.pack(side=RIGHT)
+        self.badge_lbl.pack(side=tk.RIGHT, padx=(6, 0))
 
         # 2. Connection & Target Card
         self._create_connection_card(main_frame)
@@ -173,33 +361,31 @@ class Stm32FlasherApp:
         self._create_log_console(main_frame)
 
     def _create_connection_card(self, parent):
-        card = tb.Labelframe(parent, text=" Target & Port ", padding=(10, 6))
-        card.pack(fill=X, pady=(0, 6))
+        card = ttk.LabelFrame(parent, text=" Target & Port ", padding=(10, 6))
+        card.pack(fill=tk.X, pady=(0, 6))
 
-        row = tb.Frame(card)
-        row.pack(fill=X)
+        row = ttk.Frame(card)
+        row.pack(fill=tk.X)
 
-        # Port selection
-        tb.Label(row, text="Port:", font=("Segoe UI", 11, "bold")).pack(side=LEFT, padx=(0, 4))
-        self.cbo_ports = tb.Combobox(row, textvariable=self.var_port, state="readonly", width=22)
-        self.cbo_ports.pack(side=LEFT, fill=X, expand=YES, padx=(0, 4))
+        ttk.Label(row, text="Port:", style="Bold.TLabel").pack(side=tk.LEFT, padx=(0, 4))
+        self.cbo_ports = ttk.Combobox(row, textvariable=self.var_port, state="readonly", width=26, font="TkTextFont")
+        self.cbo_ports.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
 
-        tb.Button(row, text="Refresh", padding=(6, 2), bootstyle="outline-secondary", command=self._refresh_com_ports).pack(side=LEFT, padx=(0, 10))
+        ttk.Button(row, text="Refresh", width=9, command=self._refresh_com_ports).pack(side=tk.LEFT, padx=(0, 10))
 
-        # Baudrate
-        tb.Label(row, text="Baud:").pack(side=LEFT, padx=(0, 4))
-        cbo_baud = tb.Combobox(
+        ttk.Label(row, text="Baud:").pack(side=tk.LEFT, padx=(0, 4))
+        cbo_baud = ttk.Combobox(
             row,
             textvariable=self.var_baud,
             values=["9600", "19200", "38400", "57600", "115200", "230400", "460800", "921600"],
             width=8,
             state="readonly",
+            font="TkTextFont",
         )
-        cbo_baud.pack(side=LEFT, padx=(0, 10))
+        cbo_baud.pack(side=tk.LEFT, padx=(0, 10))
 
-        # Target Chip
-        tb.Label(row, text="Target:").pack(side=LEFT, padx=(0, 4))
-        self.cbo_family = tb.Combobox(
+        ttk.Label(row, text="Target:").pack(side=tk.LEFT, padx=(0, 4))
+        self.cbo_family = ttk.Combobox(
             row,
             textvariable=self.var_target_family,
             values=[
@@ -216,85 +402,87 @@ class Stm32FlasherApp:
             ],
             state="readonly",
             width=18,
+            font="TkTextFont",
         )
-        self.cbo_family.pack(side=LEFT, padx=(0, 6))
+        self.cbo_family.pack(side=tk.LEFT, padx=(0, 8))
 
-        btn_detect = tb.Button(
+        self.btn_detect = self._make_flat_button(
             row,
             text="Detect Chip",
-            padding=(8, 2),
-            bootstyle="info",
+            bg="#0aa2c0",
+            active_bg="#08849e",
+            padx=10,
+            pady=3,
             command=self._on_btn_detect_chip,
         )
-        btn_detect.pack(side=LEFT)
+        self.btn_detect.pack(side=tk.LEFT)
 
     def _create_firmware_card(self, parent):
-        card = tb.Labelframe(parent, text=" Firmware & Options ", padding=(10, 6))
-        card.pack(fill=X, pady=(0, 6))
+        card = ttk.LabelFrame(parent, text=" Firmware & Options ", padding=(10, 6))
+        card.pack(fill=tk.X, pady=(0, 6))
 
         # Row 1: File selection
-        r1 = tb.Frame(card)
-        r1.pack(fill=X, pady=(0, 4))
+        r1 = ttk.Frame(card)
+        r1.pack(fill=tk.X, pady=(0, 5))
 
-        tb.Label(r1, text="File:", width=8, font=("Segoe UI", 11, "bold")).pack(side=LEFT)
-        self.ent_filepath = tb.Entry(r1, textvariable=self.var_file_path)
-        self.ent_filepath.pack(side=LEFT, fill=X, expand=YES, padx=(0, 6))
-        tb.Button(r1, text="Browse...", padding=(10, 2), bootstyle="secondary", command=self._browse_firmware_file).pack(side=RIGHT)
+        ttk.Label(r1, text="File:", width=8, style="Bold.TLabel").pack(side=tk.LEFT)
+        self.ent_filepath = ttk.Entry(r1, textvariable=self.var_file_path, font="TkTextFont")
+        self.ent_filepath.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        ttk.Button(r1, text="Browse...", width=11, command=self._browse_firmware_file).pack(side=tk.RIGHT)
 
         # Row 2: Flash Address & File info tag
-        r2 = tb.Frame(card)
-        r2.pack(fill=X, pady=(0, 5))
+        r2 = ttk.Frame(card)
+        r2.pack(fill=tk.X, pady=(0, 5))
 
-        tb.Label(r2, text="Address:", width=8).pack(side=LEFT)
-        self.ent_addr = tb.Entry(r2, textvariable=self.var_flash_address, width=12)
-        self.ent_addr.pack(side=LEFT, padx=(0, 10))
+        ttk.Label(r2, text="Address:", width=8).pack(side=tk.LEFT)
+        self.ent_addr = ttk.Entry(r2, textvariable=self.var_flash_address, width=13, font="TkTextFont")
+        self.ent_addr.pack(side=tk.LEFT, padx=(0, 10))
 
-        self.lbl_file_details = tb.Label(
+        self.lbl_file_details = ttk.Label(
             r2,
             text="No file selected (Supports .hex and .bin).",
-            font=("Segoe UI", 11),
-            bootstyle="secondary",
+            style="Muted.TLabel",
         )
-        self.lbl_file_details.pack(side=LEFT, fill=X, expand=YES)
+        self.lbl_file_details.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        # Row 3: Flashing Options (Tidy inline layout)
-        r3 = tb.Frame(card)
-        r3.pack(fill=X)
+        # Row 3: Flashing Options
+        r3 = ttk.Frame(card)
+        r3.pack(fill=tk.X)
 
-        tb.Checkbutton(
+        ttk.Checkbutton(
             r3,
             text="Erase Flash",
             variable=self.var_erase_before_flash,
             command=self._update_erase_options_state,
-        ).pack(side=LEFT, padx=(0, 6))
+        ).pack(side=tk.LEFT, padx=(0, 8))
 
-        self.rb_erase_affected = tb.Radiobutton(
+        self.rb_erase_affected = ttk.Radiobutton(
             r3,
             text="Affected sectors only",
             variable=self.var_erase_mode,
             value="affected",
         )
-        self.rb_erase_affected.pack(side=LEFT, padx=(0, 6))
+        self.rb_erase_affected.pack(side=tk.LEFT, padx=(0, 8))
 
-        self.rb_erase_mass = tb.Radiobutton(
+        self.rb_erase_mass = ttk.Radiobutton(
             r3,
             text="Full chip",
             variable=self.var_erase_mode,
             value="mass",
         )
-        self.rb_erase_mass.pack(side=LEFT, padx=(0, 14))
+        self.rb_erase_mass.pack(side=tk.LEFT, padx=(0, 16))
 
-        tb.Checkbutton(
+        ttk.Checkbutton(
             r3,
             text="Verify after write",
             variable=self.var_verify_flash,
-        ).pack(side=LEFT, padx=(0, 12))
+        ).pack(side=tk.LEFT, padx=(0, 14))
 
-        tb.Checkbutton(
+        ttk.Checkbutton(
             r3,
             text="Auto-run user code",
             variable=self.var_auto_run,
-        ).pack(side=LEFT)
+        ).pack(side=tk.LEFT)
 
     def _update_erase_options_state(self):
         state = "normal" if self.var_erase_before_flash.get() else "disabled"
@@ -302,30 +490,36 @@ class Stm32FlasherApp:
         self.rb_erase_mass.config(state=state)
 
     def _create_advanced_hardware_section(self, parent):
-        self.adv_container = tb.Frame(parent)
-        self.adv_container.pack(fill=X, pady=(0, 4))
+        self.adv_container = ttk.Frame(parent)
+        self.adv_container.pack(fill=tk.X, pady=(0, 4))
 
-        # Toggle Button / Header
-        header_row = tb.Frame(self.adv_container)
-        header_row.pack(fill=X)
+        header_row = ttk.Frame(self.adv_container)
+        header_row.pack(fill=tk.X)
 
-        self.btn_toggle_adv = tb.Button(
+        self.btn_toggle_adv = tk.Button(
             header_row,
             text="▸ Advanced Pin & Hardware Settings",
-            bootstyle="link",
-            padding=(0, 2),
+            font="AppSmallBoldFont",
+            fg="#0d6efd",
+            activeforeground="#0a58ca",
+            relief=tk.FLAT,
+            bd=0,
+            cursor="hand2",
             command=self._toggle_advanced_panel,
         )
-        self.btn_toggle_adv.pack(side=LEFT)
+        self.btn_toggle_adv.pack(side=tk.LEFT)
 
-        # The collapsible content frame (initially hidden)
-        self.frame_advanced = tb.Labelframe(self.adv_container, text=" Hardware Sequence & Pins ", padding=(10, 6))
+        self.frame_advanced = ttk.LabelFrame(
+            self.adv_container,
+            text=" Hardware Sequence & Pins ",
+            padding=(10, 6),
+        )
 
-        r_pins = tb.Frame(self.frame_advanced)
-        r_pins.pack(fill=X, pady=(0, 4))
+        r_pins = ttk.Frame(self.frame_advanced)
+        r_pins.pack(fill=tk.X, pady=(0, 5))
 
-        tb.Label(r_pins, text="Pin Mode:").pack(side=LEFT, padx=(0, 4))
-        cbo_pin_mode = tb.Combobox(
+        ttk.Label(r_pins, text="Pin Mode:").pack(side=tk.LEFT, padx=(0, 4))
+        cbo_pin_mode = ttk.Combobox(
             r_pins,
             textvariable=self.var_pin_mode,
             values=[
@@ -333,187 +527,169 @@ class Stm32FlasherApp:
                 "DTR = BOOT, RTS = nRESET (Swapped)",
             ],
             state="readonly",
-            width=26,
+            width=28,
+            font="TkTextFont",
         )
-        cbo_pin_mode.pack(side=LEFT, padx=(0, 8))
+        cbo_pin_mode.pack(side=tk.LEFT, padx=(0, 10))
 
-        tb.Label(r_pins, text="Pulse:").pack(side=LEFT, padx=(0, 4))
-        tb.Spinbox(
+        ttk.Label(r_pins, text="Pulse:").pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Spinbox(
             r_pins,
             from_=20,
             to=1000,
             increment=20,
             textvariable=self.var_pulse_ms,
             width=5,
-        ).pack(side=LEFT, padx=(0, 2))
-        tb.Label(r_pins, text="ms").pack(side=LEFT, padx=(0, 10))
+            font="TkTextFont",
+        ).pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Label(r_pins, text="ms").pack(side=tk.LEFT, padx=(0, 12))
 
-        tb.Checkbutton(r_pins, text="Invert RTS (BOOT)", variable=self.var_invert_boot).pack(side=LEFT, padx=(0, 8))
-        tb.Checkbutton(r_pins, text="Invert DTR (nRESET)", variable=self.var_invert_reset).pack(side=LEFT)
+        ttk.Checkbutton(r_pins, text="Invert RTS (BOOT)", variable=self.var_invert_boot).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Checkbutton(r_pins, text="Invert DTR (nRESET)", variable=self.var_invert_reset).pack(side=tk.LEFT)
 
-        # Manual test triggers
-        r_btns = tb.Frame(self.frame_advanced)
-        r_btns.pack(fill=X, pady=(2, 0))
+        r_btns = ttk.Frame(self.frame_advanced)
+        r_btns.pack(fill=tk.X)
 
-        tb.Button(
-            r_btns,
-            text="Enter Boot Mode",
-            padding=(8, 2),
-            bootstyle="outline-secondary",
-            command=self._on_btn_manual_enter_boot,
-        ).pack(side=LEFT, padx=(0, 6))
-
-        tb.Button(
-            r_btns,
-            text="Exit Boot & Run",
-            padding=(8, 2),
-            bootstyle="outline-secondary",
-            command=self._on_btn_manual_exit_boot,
-        ).pack(side=LEFT, padx=(0, 6))
-
-        tb.Button(
-            r_btns,
-            text="Pulse Reset",
-            padding=(8, 2),
-            bootstyle="outline-secondary",
-            command=self._on_btn_manual_reset,
-        ).pack(side=LEFT)
+        ttk.Button(r_btns, text="Enter Boot Mode", command=self._on_btn_manual_enter_boot).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(r_btns, text="Exit Boot & Run", command=self._on_btn_manual_exit_boot).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(r_btns, text="Pulse Reset", command=self._on_btn_manual_reset).pack(side=tk.LEFT)
 
     def _toggle_advanced_panel(self):
         if self.frame_advanced.winfo_ismapped():
             self.frame_advanced.pack_forget()
             self.btn_toggle_adv.config(text="▸ Advanced Pin & Hardware Settings")
         else:
-            self.frame_advanced.pack(fill=X, pady=(3, 0))
+            self.frame_advanced.pack(fill=tk.X, pady=(4, 2))
             self.btn_toggle_adv.config(text="▾ Advanced Pin & Hardware Settings")
+            self.root.update_idletasks()
+            req_h = self.root.winfo_reqheight()
+            cur_w = self.root.winfo_width()
+            cur_h = self.root.winfo_height()
+            if cur_h < req_h:
+                self.root.geometry(f"{cur_w}x{req_h}")
 
     def _create_action_bar(self, parent):
-        action_frame = tb.Frame(parent)
-        action_frame.pack(fill=X, pady=(2, 6))
+        action_frame = ttk.Frame(parent)
+        action_frame.pack(fill=tk.X, pady=(2, 6))
 
-        # Primary Action Buttons
-        self.btn_flash = tb.Button(
+        self.btn_flash = self._make_flat_button(
             action_frame,
             text="⚡ Flash Firmware",
-            bootstyle="success",
-            style="Flash.TButton",
-            padding=(20, 8),
+            bg="#198754",
+            active_bg="#146c43",
+            font="AppBoldFont",
+            padx=18,
+            pady=6,
             command=self._on_btn_flash,
         )
-        self.btn_flash.pack(side=LEFT, padx=(0, 6))
+        self.btn_flash.pack(side=tk.LEFT, padx=(0, 8))
 
-        self.btn_erase = tb.Button(
+        self.btn_erase = ttk.Button(
             action_frame,
             text="Erase Flash",
-            bootstyle="outline-warning",
-            padding=(10, 8),
+            padding=(10, 5),
             command=self._on_btn_erase,
         )
-        self.btn_erase.pack(side=LEFT, padx=(0, 6))
+        self.btn_erase.pack(side=tk.LEFT, padx=(0, 6))
 
-        self.btn_dump = tb.Button(
+        self.btn_dump = ttk.Button(
             action_frame,
             text="Read / Backup",
-            bootstyle="outline-info",
-            padding=(10, 8),
+            padding=(10, 5),
             command=self._on_btn_dump,
         )
-        self.btn_dump.pack(side=LEFT, padx=(0, 6))
+        self.btn_dump.pack(side=tk.LEFT, padx=(0, 6))
 
-        self.btn_unprotect = tb.Button(
+        self.btn_unprotect = ttk.Button(
             action_frame,
             text="Unprotect RDP",
-            bootstyle="outline-danger",
-            padding=(10, 8),
+            padding=(10, 5),
             command=self._on_btn_unprotect,
         )
-        self.btn_unprotect.pack(side=LEFT, padx=(0, 6))
+        self.btn_unprotect.pack(side=tk.LEFT, padx=(0, 6))
 
-        self.btn_cancel = tb.Button(
+        self.btn_cancel = self._make_flat_button(
             action_frame,
             text="Cancel",
-            bootstyle="danger",
-            padding=(12, 8),
+            bg="#dc3545",
+            active_bg="#b02a37",
+            padx=14,
+            pady=6,
             state="disabled",
             command=self._on_btn_cancel,
         )
-        self.btn_cancel.pack(side=RIGHT)
+        self.btn_cancel.pack(side=tk.RIGHT)
 
         # Progress bar & status label
-        p_frame = tb.Frame(parent)
-        p_frame.pack(fill=X, pady=(0, 6))
+        p_frame = ttk.Frame(parent)
+        p_frame.pack(fill=tk.X, pady=(0, 6))
 
-        self.progress_bar = tb.Progressbar(
+        self.progress_bar = ttk.Progressbar(
             p_frame,
             variable=self.var_progress_val,
             maximum=100.0,
-            bootstyle="success-striped",
         )
-        self.progress_bar.pack(fill=X, pady=(0, 2))
+        self.progress_bar.pack(fill=tk.X, pady=(0, 3))
 
-        self.lbl_progress_status = tb.Label(
+        self.lbl_progress_status = ttk.Label(
             p_frame,
             textvariable=self.var_progress_info,
-            font=("Segoe UI", 11),
-            bootstyle="secondary",
+            style="Muted.TLabel",
         )
-        self.lbl_progress_status.pack(side=LEFT)
+        self.lbl_progress_status.pack(side=tk.LEFT)
 
     def _create_log_console(self, parent):
-        log_frame = tb.Frame(parent)
-        log_frame.pack(fill=BOTH, expand=YES)
+        log_frame = ttk.Frame(parent)
+        log_frame.pack(fill=tk.BOTH, expand=True)
 
-        # Log toolbar
-        tool_frame = tb.Frame(log_frame)
-        tool_frame.pack(fill=X, pady=(0, 2))
+        tool_frame = ttk.Frame(log_frame)
+        tool_frame.pack(fill=tk.X, pady=(0, 2))
 
-        tb.Label(
+        ttk.Label(
             tool_frame,
             text="Activity Log",
-            font=("Segoe UI", 11, "bold"),
-            bootstyle="secondary",
-        ).pack(side=LEFT)
+            style="Bold.TLabel",
+        ).pack(side=tk.LEFT)
 
-        tb.Button(
-            tool_frame,
-            text="Clear",
-            padding=(6, 1),
-            bootstyle="link",
-            command=self._clear_log,
-        ).pack(side=RIGHT)
+        ttk.Button(tool_frame, text="Clear", width=7, command=self._clear_log).pack(side=tk.RIGHT)
+        ttk.Button(tool_frame, text="Save Log...", width=11, command=self._export_log).pack(side=tk.RIGHT, padx=(0, 4))
 
-        tb.Button(
-            tool_frame,
-            text="Save Log...",
-            padding=(6, 1),
-            bootstyle="link",
-            command=self._export_log,
-        ).pack(side=RIGHT, padx=(0, 4))
+        console_box = ttk.Frame(log_frame)
+        console_box.pack(fill=tk.BOTH, expand=True)
 
-        # Scrolled Text Box with comfortable monospace font (+2 size)
-        self.txt_log = ScrolledText(
-            log_frame,
+        scrollbar = ttk.Scrollbar(console_box, orient=tk.VERTICAL)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.txt_log = tk.Text(
+            console_box,
             wrap=tk.WORD,
-            height=7,
-            autohide=True,
-            font=("Consolas", 12),
+            height=8,
+            font="AppMonoFont",
+            bg="#181a1f",
+            fg="#e6edf3",
+            insertbackground="#ffffff",
+            relief=tk.SOLID,
+            bd=1,
+            padx=8,
+            pady=6,
+            yscrollcommand=scrollbar.set,
         )
-        self.txt_log.pack(fill=BOTH, expand=YES)
+        self.txt_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.config(command=self.txt_log.yview)
 
-        # Setup Pleasant Tag Colors for Log Levels
-        self.txt_log.tag_config("INFO", foreground="#0dcaf0")
-        self.txt_log.tag_config("SUCCESS", foreground="#20c997")
-        self.txt_log.tag_config("WARNING", foreground="#ffc107")
-        self.txt_log.tag_config("ERROR", foreground="#e63946")
-        self.txt_log.tag_config("HARDWARE", foreground="#fd7e14")
-        self.txt_log.tag_config("TIME", foreground="#6c757d")
+        # High-contrast syntax colors on dark log terminal
+        self.txt_log.tag_config("INFO", foreground="#39c5bb")
+        self.txt_log.tag_config("SUCCESS", foreground="#3fb950")
+        self.txt_log.tag_config("WARNING", foreground="#d29922")
+        self.txt_log.tag_config("ERROR", foreground="#f85149")
+        self.txt_log.tag_config("HARDWARE", foreground="#ffa657")
+        self.txt_log.tag_config("TIME", foreground="#8b949e")
 
     # ================= UI Helpers =================
-    def _toggle_theme(self):
-        current_theme = self.root.style.theme.name
-        new_theme = "flatly" if current_theme in ("darkly", "superhero", "cyborg") else "darkly"
-        self.root.style.theme_use(new_theme)
-        self._apply_custom_styles()
+    def _set_badge(self, text: str, style_key: str = "primary"):
+        self.var_status_badge.set(text)
+        bg, fg = BADGE_COLORS.get(style_key, BADGE_COLORS["primary"])
+        self.badge_lbl.configure(bg=bg, fg=fg)
 
     def _refresh_com_ports(self):
         ports = SerialComm.list_ports()
@@ -521,9 +697,8 @@ class Stm32FlasherApp:
         self.cbo_ports["values"] = values
 
         if ports:
-            # Prefer CP210x, CH340, FTDI, STM32 if found
             selected = values[0]
-            for p_dev, p_lbl in ports:
+            for _, p_lbl in ports:
                 if any(x in p_lbl.upper() for x in ("CP210", "CH340", "FTDI", "STM32", "USB-SERIAL")):
                     selected = p_lbl
                     break
@@ -553,7 +728,7 @@ class Stm32FlasherApp:
             boot_pin, reset_pin = "DTR", "RTS"
         else:
             boot_pin, reset_pin = "RTS", "DTR"
-        
+
         return {
             "boot_pin": boot_pin,
             "reset_pin": reset_pin,
@@ -574,15 +749,15 @@ class Stm32FlasherApp:
     def _set_busy(self, busy: bool, badge_text: str = "", badge_style: str = "primary"):
         self.is_busy = busy
         state = "disabled" if busy else "normal"
-        self.btn_flash.config(state=state)
+        self.btn_flash.config(state=state, bg="#6c757d" if busy else "#198754")
+        self.btn_detect.config(state=state, bg="#6c757d" if busy else "#0aa2c0")
         self.btn_erase.config(state=state)
         self.btn_dump.config(state=state)
         self.btn_unprotect.config(state=state)
-        self.btn_cancel.config(state="normal" if busy else "disabled")
+        self.btn_cancel.config(state="normal" if busy else "disabled", bg="#dc3545" if busy else "#a5a5a5")
 
         if badge_text:
-            self.var_status_badge.set(badge_text)
-            self.badge_lbl.configure(bootstyle=f"{badge_style}-inverse")
+            self._set_badge(badge_text, badge_style)
 
     def log(self, message: str, level: str = "INFO"):
         def _append():
@@ -594,7 +769,10 @@ class Stm32FlasherApp:
             self.txt_log.insert(tk.END, f"{message}\n", lvl_tag)
             self.txt_log.see(tk.END)
 
-        self.root.after(0, _append)
+        if threading.get_ident() == self._main_thread_id:
+            _append()
+        else:
+            self.root.after(0, _append)
 
     def _clear_log(self):
         self.txt_log.delete("1.0", tk.END)
@@ -630,7 +808,6 @@ class Stm32FlasherApp:
         try:
             self.firmware = load_firmware(filepath, default_bin_address=addr)
             if self.firmware.file_type == "HEX":
-                # Auto-set address field from HEX file's starting address
                 self.var_flash_address.set(f"0x{self.firmware.start_address:08X}")
 
             family = self._get_target_family()
@@ -644,14 +821,14 @@ class Stm32FlasherApp:
                 f"Addr: 0x{self.firmware.start_address:08X} - 0x{self.firmware.end_address:08X} | "
                 f"Sectors: {sectors} | CRC32: {self.firmware.crc32_str}"
             )
-            self.lbl_file_details.config(text=info_text, bootstyle="success")
+            self.lbl_file_details.config(text=info_text, style="Success.TLabel")
             self.log(f"[File] Loaded firmware: {self.firmware.filename} ({self.firmware.size_bytes:,} bytes, {self.firmware.file_type})", "SUCCESS")
             self.log(f"[File] Target Address Range: 0x{self.firmware.start_address:08X} - 0x{self.firmware.end_address:08X}", "INFO")
             self.log(f"[File] Affected Flash Sectors: {sec_desc}", "INFO")
         except Exception as e:
             self.firmware = None
             err_msg = f"Failed to load firmware: {e}"
-            self.lbl_file_details.config(text=err_msg, bootstyle="danger")
+            self.lbl_file_details.config(text=err_msg, style="Danger.TLabel")
             self.log(f"[File] {err_msg}", "ERROR")
 
     # ================= Background Execution Helper =================
@@ -660,7 +837,7 @@ class Stm32FlasherApp:
             return
         self.cancel_requested = False
         self._set_busy(True, badge_text=badge_text, badge_style="warning")
-        
+
         thread = threading.Thread(target=target, daemon=True)
         thread.start()
 
@@ -683,7 +860,6 @@ class Stm32FlasherApp:
         comm.connect()
 
         if enter_boot:
-            # Trigger custom boot sequence: Assert RTS (BOOT) => Pulse DTR (nRESET) 100ms => Release DTR
             comm.enter_boot_mode(
                 boot_pin=pin_cfg["boot_pin"],
                 reset_pin=pin_cfg["reset_pin"],
@@ -694,11 +870,10 @@ class Stm32FlasherApp:
             )
 
         bl = Stm32Bootloader(comm, log_callback=self.log)
-        
+
         try:
             bl.synchronize()
         except CommandError as sync_err:
-            # Auto-recovery: If sync failed and user hasn't inverted BOOT, test inverted RTS logic once
             if not pin_cfg["invert_boot"]:
                 self.log("[Auto-Sync] Initial sync attempt failed. Testing inverted RTS (BOOT) logic...", "WARNING")
                 comm.enter_boot_mode(
@@ -716,7 +891,6 @@ class Stm32FlasherApp:
                     return comm, bl
                 except Exception:
                     pass
-            # If still fails, re-raise original sync error
             raise sync_err
 
         return comm, bl
@@ -731,7 +905,6 @@ class Stm32FlasherApp:
                 target_fam = self._get_target_family()
                 detected = bl.detect_chip(target_fam)
 
-                # Report detected info
                 self.log("================ CHIP IDENTIFIED ================", "SUCCESS")
                 self.log(f"  Chip Model: {detected.name}", "SUCCESS")
                 self.log(f"  Chip ID   : 0x{detected.chip_id:04X}", "SUCCESS")
@@ -742,20 +915,21 @@ class Stm32FlasherApp:
                 self.log(f"  Ext Erase : {'Supported (0x44)' if detected.has_extended_erase else 'Not supported'}", "INFO")
                 self.log("=================================================", "SUCCESS")
 
-                # Update UI
                 def update_ui():
                     self.var_progress_info.set(f"Detected: {detected.name} ({detected.flash_size_kb} KB Flash)")
-                    self.var_status_badge.set(f"{detected.family} - 0x{detected.chip_id:03X}")
-                    self.badge_lbl.configure(bootstyle="info-inverse")
+                    self._set_badge(f"{detected.family} - 0x{detected.chip_id:03X}", "info")
 
                 self.root.after(0, update_ui)
 
             except Exception as e:
                 self.log(f"[Detect Error] {e}", "ERROR")
-                self.log("[Troubleshooting Tips]\n"
-                         "  1. Ensure TX/RX lines are cross-connected (PC TX -> MCU RX, PC RX -> MCU TX).\n"
-                         "  2. Verify RTS is connected to BOOT0 and DTR is connected to NRST.\n"
-                         "  3. Check 'Invert RTS (BOOT)' or 'Invert DTR (nRESET)' if active level differs.", "WARNING")
+                self.log(
+                    "[Troubleshooting Tips]\n"
+                    "  1. Ensure TX/RX lines are cross-connected (PC TX -> MCU RX, PC RX -> MCU TX).\n"
+                    "  2. Verify RTS is connected to BOOT0 and DTR is connected to NRST.\n"
+                    "  3. Check 'Invert RTS (BOOT)' or 'Invert DTR (nRESET)' if active level differs.",
+                    "WARNING",
+                )
                 self.root.after(0, lambda: messagebox.showerror("Detection Failed", f"Could not detect STM32 microcontroller:\n{e}"))
             finally:
                 if comm:
@@ -771,7 +945,6 @@ class Stm32FlasherApp:
             messagebox.showwarning("No File Selected", "Please select a .hex or .bin firmware file first!")
             return
 
-        # Ensure firmware is loaded
         if not self.firmware or self.firmware.filepath != os.path.abspath(filepath):
             self._load_and_display_firmware(filepath)
             if not self.firmware:
@@ -798,17 +971,14 @@ class Stm32FlasherApp:
 
                 comm, bl = self._open_connection_and_sync(enter_boot=True)
 
-                # Chip detection & family auto-setup
                 target_fam = self._get_target_family()
                 detected = bl.detect_chip(target_fam)
                 self.log(f"[Flash] Target detected: {detected.name} (Flash: {detected.flash_size_kb} KB)", "SUCCESS")
 
-                # Erase Flash if requested
                 if erase_first:
-                    self.var_status_badge.set("ERASING...")
-                    
+                    self.root.after(0, lambda: self._set_badge("ERASING...", "warning"))
+
                     if erase_mode == "affected":
-                        # Only erase sectors touched by the firmware
                         affected_sectors, sec_desc = get_affected_sectors(
                             detected.family, write_addr, len(self.firmware.data)
                         )
@@ -820,7 +990,6 @@ class Stm32FlasherApp:
                             progress_callback=lambda msg: self.var_progress_info.set(msg),
                         )
                     else:
-                        # Full chip mass erase
                         self.log("[Erase] Full Chip Mass Erase requested...", "INFO")
                         self.var_progress_info.set("Erasing Full Chip Flash (10-25s)...")
                         bl.erase_flash(
@@ -828,8 +997,7 @@ class Stm32FlasherApp:
                             progress_callback=lambda msg: self.var_progress_info.set(msg),
                         )
 
-                # Write Flash
-                self.var_status_badge.set("PROGRAMMING...")
+                self.root.after(0, lambda: self._set_badge("PROGRAMMING...", "info"))
                 self.log("[Flash] Writing firmware blocks to Flash...", "INFO")
 
                 def on_write_prog(done, total, msg):
@@ -846,12 +1014,11 @@ class Stm32FlasherApp:
 
                 self.log("[Flash] Firmware blocks written successfully!", "SUCCESS")
 
-                # Verify Flash
                 if verify_after:
-                    self.var_status_badge.set("VERIFYING...")
+                    self.root.after(0, lambda: self._set_badge("VERIFYING...", "info"))
                     self.log("[Flash] Reading back Flash to verify integrity...", "INFO")
 
-                    def on_verify_prog(done, total, msg):
+                    def on_verify_prog(done, total, _msg):
                         pct = (done / total) * 100.0
                         self.root.after(0, lambda: self.var_progress_val.set(pct))
                         self.root.after(0, lambda: self.var_progress_info.set(f"Verifying: {pct:.1f}% ({done}/{total} bytes)"))
@@ -864,7 +1031,6 @@ class Stm32FlasherApp:
                     )
                     self.log("[Flash] Flash verification completed: 100% byte match!", "SUCCESS")
 
-                # Auto Exit Boot & Run User Code
                 if auto_run:
                     self.log("[Flash] Exiting bootloader to run user application...", "INFO")
                     comm.exit_boot_mode(
@@ -876,7 +1042,7 @@ class Stm32FlasherApp:
                         log_callback=lambda msg, *_: self.log(msg, "HARDWARE"),
                     )
 
-                self.log("[Flash] FIRMWARE FLASHING COMPLETED SUCCESSFULLY! 🎉", "SUCCESS")
+                self.log("[Flash] FIRMWARE FLASHING COMPLETED SUCCESSFULLY!", "SUCCESS")
                 self.root.after(0, lambda: self.var_progress_info.set("Flashing successful! Microcontroller is running."))
                 self.root.after(0, lambda: self.var_progress_val.set(100.0))
                 self.root.after(0, lambda: messagebox.showinfo("Programming Succeeded", f"Successfully flashed '{self.firmware.filename}' onto STM32!"))
@@ -896,7 +1062,6 @@ class Stm32FlasherApp:
         self._run_in_thread(worker, badge_text="FLASHING...")
 
     def _on_btn_erase(self):
-        # Choose erase scope
         if self.firmware:
             res = messagebox.askyesnocancel(
                 "Erase Flash",
@@ -907,7 +1072,7 @@ class Stm32FlasherApp:
             )
             if res is None:
                 return
-            only_affected = (res is True)
+            only_affected = res is True
         else:
             if not messagebox.askyesno("Confirm Flash Erase", "Are you sure you want to perform a FULL CHIP MASS ERASE on STM32?"):
                 return
@@ -1104,4 +1269,3 @@ class Stm32FlasherApp:
                 self.root.after(0, lambda: self._set_busy(False, "READY", "primary"))
 
         self._run_in_thread(worker, badge_text="PULSE RESET...")
-
